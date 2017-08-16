@@ -1,7 +1,6 @@
 package com.chinaums.poscomm;
 
 import java.text.DecimalFormat;
-import java.util.concurrent.Executors;
 
 public class TestCaller {
     public static void main(String[] args) throws Throwable {
