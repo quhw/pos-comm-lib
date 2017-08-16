@@ -22,6 +22,7 @@ import java.text.DecimalFormat;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -32,8 +33,8 @@ import java.util.concurrent.TimeUnit;
  *
  * @author 焕文
  */
-public class PospCaller implements RemovalListener<String, Context> {
-    private static Logger log = LoggerFactory.getLogger(PospCaller.class);
+public class LongTCPTransportWithTPDU implements RemovalListener<String, Context> {
+    private static Logger log = LoggerFactory.getLogger(LongTCPTransportWithTPDU.class);
     private static final AttributeKey<Integer> CHANNEL_SEQ_KEY = AttributeKey.valueOf("channel.seq.key");
     private static final AttributeKey<String> CHANNEL_ID_KEY = AttributeKey.valueOf("channel.id.key");
 
@@ -81,6 +82,8 @@ public class PospCaller implements RemovalListener<String, Context> {
     private Timer refreshContextMapTimer;
 
     private Random random = new Random(System.currentTimeMillis());
+
+    private boolean started = false;
 
     public void setHosts(String hosts) {
         this.hosts = hosts;
@@ -147,6 +150,15 @@ public class PospCaller implements RemovalListener<String, Context> {
     }
 
     public void start() {
+        if (started) {
+            throw new RuntimeException("通讯程序已经启动");
+        }
+        started = true;
+
+        if (executorService == null) {
+            executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() * 2);
+        }
+
         contextMap = CacheBuilder
                 .newBuilder()
                 .expireAfterWrite(timeout, TimeUnit.SECONDS)
@@ -197,7 +209,7 @@ public class PospCaller implements RemovalListener<String, Context> {
         bossGroup.shutdownGracefully().syncUninterruptibly();
     }
 
-    public void send(MsgPacket requestMsg, final PospCallerCallback callback) {
+    public void send(MsgPacket requestMsg, final ITransportCallback callback) {
         Channel channel = getChannel();
         if (channel == null) {
             log.warn("没有可用服务，无法发送报文请求");
@@ -209,66 +221,82 @@ public class PospCaller implements RemovalListener<String, Context> {
             return;
         }
 
-        String msgKey;
-        Integer seq;
-        synchronized (channel) {
-            seq = channel.attr(CHANNEL_SEQ_KEY).get();
-            if (seq == null) {
-                seq = 0;
-            }
-            int nextSeq = seq + 1;
-            if (nextSeq > 9999) {
-                nextSeq = 0;
-            }
-            channel.attr(CHANNEL_SEQ_KEY).set(nextSeq);
+        try {
+            String msgKey;
+            String seqStr;
+            synchronized (channel) {
+                Integer seq = channel.attr(CHANNEL_SEQ_KEY).get();
+                if (seq == null) {
+                    seq = 0;
+                }
+                int nextSeq = seq + 1;
+                if (nextSeq > 9999) {
+                    nextSeq = 0;
+                }
+                channel.attr(CHANNEL_SEQ_KEY).set(nextSeq);
 
-            String id = channel.attr(CHANNEL_ID_KEY).get();
-            if (id == null) {
-                id = UUID.randomUUID().toString();
-                channel.attr(CHANNEL_ID_KEY).set(id);
+                String id = channel.attr(CHANNEL_ID_KEY).get();
+                if (id == null) {
+                    id = UUID.randomUUID().toString();
+                    channel.attr(CHANNEL_ID_KEY).set(id);
+                }
+
+                seqStr = new DecimalFormat("0000").format(seq);
+                msgKey = id + ":" + seqStr;
             }
 
-            msgKey = id + ":" + seq;
+            MsgPacket msg = new MsgPacket(requestMsg.getVersion(),
+                    requestMsg.getTpduDst(), seqStr, requestMsg.getPayload());
+
+
+            Context context = new Context();
+            context.callback = callback;
+            context.origTpduSrc = requestMsg.getTpduSrc();
+            contextMap.put(msgKey, context);
+
+            log.info("数据发往: {}", channel.remoteAddress());
+            channel.writeAndFlush(msg);
+        } catch (final Exception e) {
+            log.error("", e);
+            executorService.submit(new Runnable() {
+                public void run() {
+                    callback.onError(e);
+                }
+            });
+            return;
         }
-
-        String seqStr = new DecimalFormat("0000").format(seq);
-        MsgPacket msg = new MsgPacket(requestMsg.getVersion(),
-                requestMsg.getTpduDst(), seqStr, requestMsg.getPayload());
-
-
-        Context context = new Context();
-        context.callback = callback;
-        context.origTpduSrc = requestMsg.getTpduSrc();
-        contextMap.put(msgKey, context);
-
-        log.info("数据发往: {}", channel.remoteAddress());
-        channel.writeAndFlush(msg);
     }
 
     public MsgPacket send(final MsgPacket requestMsg) throws Throwable {
         final CountDownLatch cdl = new CountDownLatch(1);
         final ResultWrapper result = new ResultWrapper();
-        send(requestMsg, new PospCallerCallback() {
+        send(requestMsg, new ITransportCallback() {
             public void onSuccess(MsgPacket msg) {
                 result.msg = msg;
                 cdl.countDown();
             }
 
             public void onTimeout() {
-                result.throwable = new Exception("调用超时");
+                result.exception = new Exception("调用超时");
                 cdl.countDown();
             }
 
-            public void onError(Throwable e) {
-                result.throwable = e;
+            public void onError(Exception e) {
+                result.exception = e;
                 cdl.countDown();
             }
         });
 
-        cdl.await();
+        try {
+            // 确保超时
+            cdl.await(timeout + 5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            result.exception = new Exception("调用超时");
+            ;
+        }
 
-        if (result.throwable != null) {
-            throw result.throwable;
+        if (result.exception != null) {
+            throw result.exception;
         }
         return result.msg;
     }
